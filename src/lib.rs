@@ -44,7 +44,7 @@ pub async fn run_main(
         ..ConfigOverrides::default()
     };
 
-    let config =
+    let mut config =
         Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
             .await
             .map_err(|e| {
@@ -53,6 +53,54 @@ pub async fn run_main(
                     format!("error loading config: {e}"),
                 )
             })?;
+
+    // --- NuwaClaw: environment variable overrides ---
+    // Priority: config.toml fields > env vars > hardcoded defaults
+    // These CODEX_* vars are injected by the Electron host (acpClient.ts)
+    // to deliver ACP-distributed model configuration without writing
+    // sensitive data to disk.
+
+    // CODEX_BASE_URL → override current provider's base_url
+    if config.model_provider.base_url.is_none() {
+        if let Ok(url) = std::env::var("CODEX_BASE_URL") {
+            if !url.trim().is_empty() {
+                tracing::info!("CODEX_BASE_URL env var overriding provider base_url");
+                config.model_provider.base_url = Some(url.clone());
+                // Also update the entry in model_providers map so downstream
+                // code that reads from the map sees the override.
+                if let Some(provider) =
+                    config.model_providers.get_mut(&config.model_provider_id)
+                {
+                    provider.base_url = Some(url);
+                }
+            }
+        }
+    }
+
+    // CODEX_API_KEY → override API key
+    // The built-in OpenAI provider has env_key = None, so AuthManager reads
+    // OPENAI_API_KEY directly. We write CODEX_API_KEY into OPENAI_API_KEY
+    // so AuthManager picks it up normally.
+    if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
+        if !api_key.trim().is_empty() {
+            tracing::info!("CODEX_API_KEY env var overriding OPENAI_API_KEY");
+            // SAFETY: This runs in run_main before the Tokio runtime is
+            // multi-threaded (we are still in single-threaded setup).
+            // CodexAgent::new() below is the first spawn point.
+            unsafe { std::env::set_var("OPENAI_API_KEY", &api_key) };
+        }
+    }
+
+    // CODEX_MODEL → override model name
+    if config.model.is_none() {
+        if let Ok(model) = std::env::var("CODEX_MODEL") {
+            if !model.trim().is_empty() {
+                tracing::info!("CODEX_MODEL env var overriding config model");
+                config.model = Some(model);
+            }
+        }
+    }
+    // --- End NuwaClaw overrides ---
     // Apply residency requirement so the HTTP client sends the
     // x-openai-internal-codex-residency header on all requests.
     codex_login::default_client::set_default_client_residency_requirement(
