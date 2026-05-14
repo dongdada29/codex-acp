@@ -3,6 +3,7 @@
 
 use agent_client_protocol::ByteStreams;
 use codex_core::config::{Config, ConfigOverrides};
+use codex_model_provider_info::{ModelProviderInfo, WireApi};
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +12,81 @@ use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
 mod thread;
+
+const NUWACLAW_PROVIDER_ID: &str = "nuwaclaw-openai-compatible";
+const OPENAI_COMPATIBLE_MODEL_PREFIX: &str = "openai-compatible/";
+
+struct NuwaclawEnvOverrides {
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_model_for_provider(model: &str) -> String {
+    model
+        .trim()
+        .strip_prefix(OPENAI_COMPATIBLE_MODEL_PREFIX)
+        .unwrap_or(model.trim())
+        .trim()
+        .to_string()
+}
+
+fn read_nuwaclaw_env_overrides() -> NuwaclawEnvOverrides {
+    NuwaclawEnvOverrides {
+        model: env_non_empty("CODEX_MODEL").map(|model| normalize_model_for_provider(&model)),
+        base_url: env_non_empty("CODEX_BASE_URL"),
+        api_key: env_non_empty("CODEX_API_KEY"),
+    }
+}
+
+fn apply_nuwaclaw_env_overrides(config: &mut Config) {
+    let overrides = read_nuwaclaw_env_overrides();
+
+    if let Some(api_key) = overrides.api_key {
+        tracing::info!("CODEX_API_KEY env var overriding OPENAI_API_KEY");
+        // SAFETY: This runs during single-threaded process setup before
+        // CodexAgent::new() starts async session work that can read auth env.
+        unsafe { std::env::set_var("OPENAI_API_KEY", api_key) };
+    }
+
+    if let Some(model) = overrides.model {
+        tracing::info!("CODEX_MODEL env var overriding config model");
+        config.model = Some(model);
+    }
+
+    if let Some(base_url) = overrides.base_url {
+        tracing::info!("CODEX_BASE_URL env var overriding model provider base_url");
+        let mut provider = config
+            .model_providers
+            .get(&config.model_provider_id)
+            .cloned()
+            .unwrap_or_else(ModelProviderInfo::default);
+
+        provider.name = "NuwaClaw OpenAI Compatible".to_string();
+        provider.base_url = Some(base_url);
+        provider.env_key = Some("OPENAI_API_KEY".to_string());
+        provider.env_key_instructions = None;
+        provider.experimental_bearer_token = None;
+        provider.auth = None;
+        provider.aws = None;
+        provider.wire_api = WireApi::Responses;
+        provider.requires_openai_auth = false;
+        provider.supports_websockets = false;
+
+        config.model_provider_id = NUWACLAW_PROVIDER_ID.to_string();
+        config.model_provider = provider.clone();
+        config
+            .model_providers
+            .insert(NUWACLAW_PROVIDER_ID.to_string(), provider);
+    }
+}
 
 /// Run the Codex ACP agent.
 ///
@@ -54,53 +130,8 @@ pub async fn run_main(
                 )
             })?;
 
-    // --- NuwaClaw: environment variable overrides ---
-    // Priority: config.toml fields > env vars > hardcoded defaults
-    // These CODEX_* vars are injected by the Electron host (acpClient.ts)
-    // to deliver ACP-distributed model configuration without writing
-    // sensitive data to disk.
+    apply_nuwaclaw_env_overrides(&mut config);
 
-    // CODEX_BASE_URL → override current provider's base_url
-    if config.model_provider.base_url.is_none() {
-        if let Ok(url) = std::env::var("CODEX_BASE_URL") {
-            if !url.trim().is_empty() {
-                tracing::info!("CODEX_BASE_URL env var overriding provider base_url");
-                config.model_provider.base_url = Some(url.clone());
-                // Also update the entry in model_providers map so downstream
-                // code that reads from the map sees the override.
-                if let Some(provider) =
-                    config.model_providers.get_mut(&config.model_provider_id)
-                {
-                    provider.base_url = Some(url);
-                }
-            }
-        }
-    }
-
-    // CODEX_API_KEY → override API key
-    // The built-in OpenAI provider has env_key = None, so AuthManager reads
-    // OPENAI_API_KEY directly. We write CODEX_API_KEY into OPENAI_API_KEY
-    // so AuthManager picks it up normally.
-    if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
-        if !api_key.trim().is_empty() {
-            tracing::info!("CODEX_API_KEY env var overriding OPENAI_API_KEY");
-            // SAFETY: This runs in run_main before the Tokio runtime is
-            // multi-threaded (we are still in single-threaded setup).
-            // CodexAgent::new() below is the first spawn point.
-            unsafe { std::env::set_var("OPENAI_API_KEY", &api_key) };
-        }
-    }
-
-    // CODEX_MODEL → override model name
-    if config.model.is_none() {
-        if let Ok(model) = std::env::var("CODEX_MODEL") {
-            if !model.trim().is_empty() {
-                tracing::info!("CODEX_MODEL env var overriding config model");
-                config.model = Some(model);
-            }
-        }
-    }
-    // --- End NuwaClaw overrides ---
     // Apply residency requirement so the HTTP client sends the
     // x-openai-internal-codex-residency header on all requests.
     codex_login::default_client::set_default_client_residency_requirement(
@@ -125,3 +156,21 @@ pub use codex_mcp_server::{
     CodexToolCallParam, CodexToolCallReplyParam, ExecApprovalElicitRequestParams,
     ExecApprovalResponse, PatchApprovalElicitRequestParams, PatchApprovalResponse,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_model_for_provider;
+
+    #[test]
+    fn normalize_model_strips_openai_compatible_prefix() {
+        assert_eq!(
+            normalize_model_for_provider("openai-compatible/glm-5"),
+            "glm-5"
+        );
+        assert_eq!(
+            normalize_model_for_provider(" openai-compatible/glm-5 "),
+            "glm-5"
+        );
+        assert_eq!(normalize_model_for_provider("glm-5"), "glm-5");
+    }
+}
